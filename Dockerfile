@@ -4,7 +4,7 @@ WORKDIR /app
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
-    DATA_DIR=/var/data \
+    DATA_DIR=/tmp/meow-data \
     PORT=10000
 
 COPY requirements.txt ./
