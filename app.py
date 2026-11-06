@@ -481,11 +481,21 @@ def login():
 
     _clear_login_failures(ip)
     session.clear()  # Prevent session fixation.
-    session.update(identity)
+    # Keep the session key consistent with current_user() and login_required().
+    # Those functions read "user_id"; the previous code stored the identifier as "id",
+    # which caused every successful login to be redirected straight back to /login.
+    session["user_id"] = str(identity["id"])
+    session["username"] = str(identity["username"])
+    session["role"] = str(identity["role"])
     if identity["role"] == "owner":
         session["owner_auth_marker"] = owner_auth_marker()
     session["csrf_token"] = secrets.token_urlsafe(32)
     session.permanent = True
+    log.info(
+        "login session established: role=%s user_id_present=%s",
+        session.get("role", ""),
+        bool(session.get("user_id")),
+    )
     response = redirect(url_for("index"))
     response.headers["Cache-Control"] = "no-store"
     return response
