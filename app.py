@@ -105,9 +105,30 @@ def health():
     return jsonify({
         "ok": ok,
         "service": state.get("service"),
+        "storage": runtime.store.backend,
+        "telegram_connected": state.get("telegram_connected", False),
+        "session_saved_at": state.get("session_saved_at"),
         "time": datetime.now(timezone.utc).isoformat(),
         "keepalive": keepalive,
     }), (200 if ok else 503)
+
+
+@app.get("/wake")
+def wake():
+    """Lightweight inbound route: Render wakes the Free instance when this URL is requested."""
+    state = dict(runtime._status)
+    ready = bool(state.get("browser_started"))
+    response = jsonify({
+        "ok": True,
+        "service": state.get("service", "starting"),
+        "storage": runtime.store.backend,
+        "browser_started": ready,
+        "telegram_connected": state.get("telegram_connected", False),
+        "message": "service is awake" if ready else "service is waking up; retry shortly",
+    })
+    response.headers["Retry-After"] = "10" if not ready else "0"
+    # Always 200 so simple external uptime monitors can use this path as a wake ping.
+    return response, 200
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -291,11 +312,25 @@ def external_send_hook():
     if not target or not text or len(text) > 1500:
         return jsonify({"error": "target and text are required; text max is 1500 chars"}), 400
     try:
+        runtime.wait_for_browser(timeout=int(os.getenv("WAKE_WAIT_SECONDS", "55")), require_connected=True)
+        if not runtime.telegram:
+            raise RuntimeError("مرورگر تلگرام آماده نیست؛ چند لحظه دیگر دوباره درخواست را بفرست")
         result = runtime.submit(runtime.telegram.send_message(target, text), timeout=40)
         runtime.store.add_event("success", f"پیام از webhook به {target} ارسال شد")
         return jsonify(result)
+    except TimeoutError as exc:
+        try:
+            runtime.store.add_event("warning", f"webhook needs retry after wake: {exc}")
+        except Exception:
+            pass
+        response = jsonify({"ok": False, "retry": True, "error": str(exc)})
+        response.headers["Retry-After"] = "10"
+        return response, 503
     except Exception as exc:
-        runtime.store.add_event("error", f"webhook send failed: {exc}")
+        try:
+            runtime.store.add_event("error", f"webhook send failed: {exc}")
+        except Exception:
+            pass
         return jsonify({"error": str(exc)}), 400
 
 
