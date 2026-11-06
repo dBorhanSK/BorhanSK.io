@@ -11,7 +11,10 @@ import urllib.request
 from datetime import datetime, timezone
 from functools import wraps
 from io import BytesIO
+from urllib.parse import urlsplit
 
+from itsdangerous import BadSignature, URLSafeTimedSerializer
+from werkzeug.middleware.proxy_fix import ProxyFix
 from flask import Flask, jsonify, make_response, redirect, render_template, request, send_file, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
 from dotenv import load_dotenv
@@ -29,6 +32,8 @@ _secret = os.getenv("SECRET_KEY", "").strip()
 _is_production = bool(os.getenv("RENDER") or os.getenv("RENDER_EXTERNAL_URL"))
 if not _secret and _is_production:
     raise RuntimeError("SECRET_KEY در محیط Render تنظیم نشده است")
+if _is_production and len(_secret) < 32:
+    raise RuntimeError("SECRET_KEY در Render باید حداقل ۳۲ نویسه تصادفی داشته باشد")
 app.secret_key = _secret or secrets.token_urlsafe(48)
 _cookie_secure = os.getenv("COOKIE_SECURE", "true" if _is_production else "false").lower() == "true"
 app.config.update(
@@ -41,6 +46,59 @@ app.config.update(
     MAX_CONTENT_LENGTH=128 * 1024,
     TRUSTED_HOSTS=[x.strip() for x in os.getenv("TRUSTED_HOSTS", "").split(",") if x.strip()] or None,
 )
+# Render terminates TLS and forwards the original client IP/protocol in these headers.
+# Trust exactly one proxy hop; never trust arbitrary X-Forwarded-* chains.
+if _is_production:
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
+
+_LOGIN_CSRF_SALT = "borhan-sk-login-csrf-v1"
+_LOGIN_CSRF_MAX_AGE = 15 * 60
+
+def _login_csrf_serializer() -> URLSafeTimedSerializer:
+    return URLSafeTimedSerializer(app.secret_key, salt=_LOGIN_CSRF_SALT)
+
+def _new_login_csrf_token() -> str:
+    return _login_csrf_serializer().dumps({"purpose": "login", "nonce": secrets.token_urlsafe(24)})
+
+def _valid_login_csrf_token(token: str) -> bool:
+    if not token or len(token) > 2048:
+        return False
+    try:
+        payload = _login_csrf_serializer().loads(token, max_age=_LOGIN_CSRF_MAX_AGE)
+    except (BadSignature, TypeError, ValueError):
+        return False
+    return (
+        isinstance(payload, dict)
+        and payload.get("purpose") == "login"
+        and isinstance(payload.get("nonce"), str)
+        and len(payload["nonce"]) >= 24
+    )
+
+def _same_origin_login_post() -> bool:
+    """Require browser-supplied same-origin evidence for the login form POST."""
+    expected_host = (request.host or "").lower().rstrip(".")
+    expected_scheme = "https" if _is_production else request.scheme
+
+    def matches(value: str) -> bool:
+        try:
+            parsed = urlsplit(value)
+            if not parsed.netloc or parsed.username or parsed.password:
+                return False
+            return (
+                parsed.netloc.lower().rstrip(".") == expected_host
+                and parsed.scheme.lower() == expected_scheme
+            )
+        except (TypeError, ValueError):
+            return False
+
+    origin = request.headers.get("Origin", "").strip()
+    if origin:
+        return matches(origin)
+    referer = request.headers.get("Referer", "").strip()
+    if referer:
+        return matches(referer)
+    # Modern browsers send Fetch Metadata even when Origin/Referer are omitted.
+    return request.headers.get("Sec-Fetch-Site", "").lower() == "same-origin"
 if _is_production and len(os.getenv("DASHBOARD_PASSWORD", "")) < 12:
     raise RuntimeError("DASHBOARD_PASSWORD در Render باید حداقل ۱۲ نویسه داشته باشد")
 
@@ -73,7 +131,13 @@ def ensure_runtime():
             _runtime_started = True
 
 
-ensure_runtime()
+@app.before_request
+def _start_runtime_for_request():
+    # Start the async browser engine after the WSGI worker has accepted a request.
+    # This also keeps Flask's auth routes testable without launching Chromium.
+    ensure_runtime()
+
+
 atexit.register(runtime.shutdown)
 
 
@@ -111,8 +175,17 @@ def login_required(fn):
                 member = runtime.store.get_member(str(session.get("username", "")))
                 authenticated = bool(member and member.get("id") == user_id)
             except Exception:
+                # A temporary Supabase outage must not silently destroy a valid
+                # admin session; distinguish backend failure from a deleted admin.
                 log.exception("could not validate active admin session")
-                authenticated = False
+                if request.path.startswith("/api/"):
+                    return jsonify({"error": "بررسی حساب ادمین موقتاً ممکن نیست؛ کمی بعد دوباره تلاش کن"}), 503
+                response = make_response(render_template(
+                    "login.html",
+                    error="ارتباط با پایگاه داده موقتاً برقرار نیست؛ صفحه را تازه کن.",
+                    login_csrf=_new_login_csrf_token(),
+                ), 503)
+                return response
         if not authenticated:
             session.clear()
             if request.path.startswith("/api/"):
@@ -177,7 +250,8 @@ def scoped_account_rows() -> list[dict]:
             **row,
             "owner_access": bool(row.get("owner_access")),
             "connected": bool(live.get("connected")),
-            "last_error": str(live.get("last_error", ""))[:240],
+            "last_error": (str(live.get("last_error", ""))[:240]
+                           if is_mine or (user["role"] == "owner" and owner_can_access_account(row)) else ""),
             "can_open_session": is_mine,
             "can_inspect": is_mine or (user["role"] == "owner" and owner_can_access_account(row)),
             "can_manage_session": is_mine or (user["role"] == "owner" and owner_can_access_account(row)),
@@ -308,19 +382,28 @@ def _clear_login_failures(ip: str):
 @app.route("/login", methods=["GET", "POST"])
 def login():
     ip = request.remote_addr or "unknown"
-    blocked, wait_seconds = _login_blocked(ip)
     if request.method == "GET":
-        token = secrets.token_urlsafe(32)
-        session["login_csrf"] = token
-        return render_template("login.html", error="", login_csrf=token)
-    if blocked:
-        return render_template("login.html", error=f"تلاش‌های زیاد؛ {wait_seconds} ثانیه دیگر دوباره امتحان کن.",
-                               login_csrf=session.get("login_csrf", "")), 429
-    expected_csrf = session.get("login_csrf", "")
+        # Login CSRF is a short-lived signed token instead of a value stored in the
+        # Flask session cookie. This avoids false 403s when a browser omits the
+        # pre-auth session cookie, while same-origin validation still blocks CSRF.
+        return render_template("login.html", error="", login_csrf=_new_login_csrf_token())
+
     supplied_csrf = request.form.get("login_csrf", "")
-    if not expected_csrf or not supplied_csrf or not hmac.compare_digest(expected_csrf, supplied_csrf):
-        return render_template("login.html", error="درخواست ورود نامعتبر است؛ صفحه را تازه کن.",
-                               login_csrf=session.get("login_csrf", "")), 403
+    if not _same_origin_login_post() or not _valid_login_csrf_token(supplied_csrf):
+        log.warning("login request rejected by origin/CSRF validation from %s", ip)
+        return render_template(
+            "login.html",
+            error="درخواست ورود نامعتبر یا منقضی شده است؛ صفحه ورود را تازه کن.",
+            login_csrf=_new_login_csrf_token(),
+        ), 403
+
+    blocked, wait_seconds = _login_blocked(ip)
+    if blocked:
+        return render_template(
+            "login.html",
+            error=f"تلاش‌های زیاد؛ {wait_seconds} ثانیه دیگر دوباره امتحان کن.",
+            login_csrf=_new_login_csrf_token(),
+        ), 429
 
     username = request.form.get("username", "").strip().lower()
     password = request.form.get("password", "")
@@ -329,11 +412,19 @@ def login():
     valid = False
     identity = None
     if username and username == owner_username and owner_password:
-        valid = hmac.compare_digest(owner_password, password)
+        valid = hmac.compare_digest(owner_password.encode("utf-8"), password.encode("utf-8"))
         if valid:
             identity = {"id": "owner", "username": owner_username, "role": "owner"}
     elif username:
-        member = runtime.store.get_member(username)
+        try:
+            member = runtime.store.get_member(username)
+        except Exception:
+            log.exception("admin credential lookup failed")
+            return render_template(
+                "login.html",
+                error="ارتباط با پایگاه داده موقتاً برقرار نیست؛ کمی بعد دوباره تلاش کن.",
+                login_csrf=_new_login_csrf_token(),
+            ), 503
         if member:
             try:
                 valid = check_password_hash(member["password_hash"], password)
@@ -341,10 +432,14 @@ def login():
                 valid = False
             if valid:
                 identity = {"id": member["id"], "username": member["username"], "role": "admin"}
+
     if not valid or not identity:
         _record_login_failure(ip)
-        return render_template("login.html", error="نام کاربری یا رمز عبور نادرست است.",
-                               login_csrf=session.get("login_csrf", "")), 401
+        return render_template(
+            "login.html",
+            error="نام کاربری یا رمز عبور نادرست است.",
+            login_csrf=_new_login_csrf_token(),
+        ), 401
 
     _clear_login_failures(ip)
     session.clear()  # Prevent session fixation.
@@ -353,7 +448,9 @@ def login():
         session["owner_auth_marker"] = owner_auth_marker()
     session["csrf_token"] = secrets.token_urlsafe(32)
     session.permanent = True
-    return redirect(url_for("index"))
+    response = redirect(url_for("index"))
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.post("/logout")
@@ -416,9 +513,9 @@ def api_accounts():
         runtime.store.add_event("info", f"حساب جدید اضافه شد: {label}", current_user()["id"])
         account["owner_access"] = False
         return jsonify(account), 201
-    except Exception as exc:
+    except Exception:
         log.exception("account creation failed")
-        return jsonify({"error": str(exc)[:300]}), 400
+        return jsonify({"error": "ساخت حساب انجام نشد؛ اتصال دیتابیس و گزارش فنی را بررسی کن"}), 503
 
 
 @app.post("/api/accounts/<account_id>/owner-access")
@@ -454,6 +551,10 @@ def api_account_qr(account_id: str):
     account = account_for_user(account_id)
     if not account:
         return jsonify({"error": "حساب پیدا نشد یا اجازه دسترسی نداری"}), 404
+    # Delegated owner access never includes the private login QR. Only the
+    # account holder may view or scan the QR for that Telegram session.
+    if account.get("owner_id") != current_user()["id"]:
+        return jsonify({"error": "نمایش QR فقط برای صاحب همان حساب مجاز است"}), 403
     try:
         telegram = runtime.get_telegram(account_id)
         if not telegram:
@@ -465,9 +566,9 @@ def api_account_qr(account_id: str):
         response = make_response(send_file(BytesIO(image), mimetype="image/png"))
         response.headers["Cache-Control"] = "no-store, max-age=0"
         return response
-    except Exception as exc:
+    except Exception:
         log.exception("QR screenshot failed")
-        return jsonify({"error": str(exc)[:300]}), 503
+        return jsonify({"error": "نمایش QR انجام نشد؛ وضعیت نشست و گزارش فنی را بررسی کن"}), 503
 
 
 @app.post("/api/accounts/<account_id>/restart")
@@ -482,8 +583,9 @@ def api_account_restart(account_id: str):
         state = runtime.submit(runtime.restart_telegram_account(account_id), timeout=90)
         log_account_action(account, f"نشست دوباره راه‌اندازی شد: {account['label']}", "info")
         return jsonify({"ok": True, "status": state})
-    except Exception as exc:
-        return jsonify({"error": str(exc)[:300]}), 400
+    except Exception:
+        log.exception("Telegram account restart failed")
+        return jsonify({"error": "راه‌اندازی مجدد حساب انجام نشد؛ گزارش فنی ثبت شد"}), 503
 
 
 @app.delete("/api/accounts/<account_id>")
@@ -504,8 +606,9 @@ def api_account_delete(account_id: str):
         runtime.store.delete_account(account_id)
         log_account_action(account, f"حساب حذف شد: {account['label']}", "warning")
         return jsonify({"ok": True})
-    except Exception as exc:
-        return jsonify({"error": str(exc)[:300]}), 400
+    except Exception:
+        log.exception("Telegram account deletion failed")
+        return jsonify({"error": "حذف حساب کامل نشد؛ گزارش فنی ثبت شد"}), 503
 
 
 # Compatibility endpoint for the old single-account QR view.
@@ -529,8 +632,9 @@ def api_browser_restart():
     try:
         state = runtime.submit(runtime.restart_telegram_account(account_id), timeout=90)
         return jsonify({"ok": True, "telegram": state})
-    except Exception as exc:
-        return jsonify({"error": str(exc)[:300]}), 400
+    except Exception:
+        log.exception("default browser restart failed")
+        return jsonify({"error": "راه‌اندازی مجدد مرورگر انجام نشد؛ گزارش فنی ثبت شد"}), 503
 
 
 def validate_job(payload):
@@ -591,8 +695,11 @@ def api_create_job():
             if account and account.get("owner_id") != "owner":
                 runtime.store.add_event("info", f"مالک زمان‌بندی «{name}» را برای حساب شما ساخت.", account["owner_id"])
         return jsonify(row), 201
-    except Exception as exc:
-        return jsonify({"error": str(exc)[:300]}), 400
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception:
+        log.exception("scheduled job creation failed")
+        return jsonify({"error": "ذخیره زمان‌بندی انجام نشد؛ گزارش فنی ثبت شد"}), 503
 
 
 @app.post("/api/jobs/<job_id>/<action>")
@@ -722,8 +829,9 @@ def api_admins():
         row = runtime.store.create_member(username, generate_password_hash(password, method="scrypt"))
         runtime.store.add_event("info", f"ادمین جدید ساخته شد: {username}", "owner")
         return jsonify(row), 201
-    except Exception as exc:
-        return jsonify({"error": str(exc)[:300]}), 400
+    except Exception:
+        log.exception("admin account creation failed")
+        return jsonify({"error": "ساخت حساب ادمین انجام نشد؛ نام کاربری یا اتصال دیتابیس را بررسی کن"}), 503
 
 
 @app.delete("/api/admins/<member_id>")
@@ -747,8 +855,9 @@ def api_admin_delete(member_id: str):
             return jsonify({"error": "ادمین پیدا نشد"}), 404
         runtime.store.add_event("warning", f"ادمین حذف شد: {member_id}", "owner")
         return jsonify({"ok": True})
-    except Exception as exc:
-        return jsonify({"error": str(exc)[:300]}), 400
+    except Exception:
+        log.exception("admin deletion failed")
+        return jsonify({"error": "حذف ادمین کامل نشد؛ گزارش فنی ثبت شد"}), 503
 
 
 @app.post("/hooks/send")
@@ -779,9 +888,9 @@ def external_send_hook():
         response = jsonify({"ok": False, "retry": True, "error": str(exc)})
         response.headers["Retry-After"] = "10"
         return response, 503
-    except Exception as exc:
+    except Exception:
         log.exception("webhook send failed")
-        return jsonify({"error": str(exc)[:300]}), 400
+        return jsonify({"error": "webhook operation failed; server log contains details"}), 503
 
 
 def default_account_id_for_owner() -> str | None:
