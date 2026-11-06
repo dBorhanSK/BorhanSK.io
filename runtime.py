@@ -90,6 +90,7 @@ class CloudRuntime:
         self.telegram: TelegramWeb | None = None  # Backwards compatibility for older routes.
         self.primary_account_id: str | None = None
         self.started = False
+        self._stopping = threading.Event()
         self._lock = threading.RLock()
         self._status: dict[str, Any] = {
             "service": "starting", "browser_started": False, "telegram_connected": False,
@@ -104,6 +105,7 @@ class CloudRuntime:
             self.thread.start()
 
     def _thread_main(self):
+        self._stopping.clear()
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         self.loop = loop
@@ -114,6 +116,12 @@ class CloudRuntime:
             task.cancel()
         if pending:
             loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        # Drain asyncio.to_thread work before closing the loop executor.
+        try:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.run_until_complete(loop.shutdown_default_executor())
+        except Exception:
+            log.exception("async runtime finalization failed")
         loop.close()
 
     async def _ensure_shared_browser(self):
@@ -375,7 +383,7 @@ class CloudRuntime:
         return await self._start_account_context(account)
 
     async def _heartbeat_loop(self):
-        while True:
+        while not self._stopping.is_set():
             try:
                 rows = []
                 for account_id, telegram in list(self.telegram_sessions.items()):
@@ -431,7 +439,7 @@ class CloudRuntime:
             await asyncio.sleep(20)
 
     async def _browser_supervisor_loop(self):
-        while True:
+        while not self._stopping.is_set():
             try:
                 # A browser that has not been started yet is intentional: secondary
                 # accounts are lazy-loaded. Only recover a browser that actually died.
@@ -493,7 +501,7 @@ class CloudRuntime:
             poll_seconds = max(8, min(60, int(os.getenv("SCHEDULER_POLL_SECONDS", "15"))))
         except (TypeError, ValueError):
             poll_seconds = 15
-        while True:
+        while not self._stopping.is_set():
             try:
                 jobs = await asyncio.to_thread(self.store.list_jobs, True, None)
                 now = utcnow()
@@ -577,7 +585,17 @@ class CloudRuntime:
                         if account_owner and account_owner != owner_id:
                             await asyncio.to_thread(self.store.add_event, "error", error_message, account_owner)
                 await asyncio.sleep(poll_seconds)
+            except RuntimeError as exc:
+                # During interpreter/worker shutdown the default executor may already
+                # be closing. This is a normal teardown condition, not a scheduler
+                # failure; retrying to_thread here only creates repeated exceptions.
+                if self._stopping.is_set() or "cannot schedule new futures" in str(exc):
+                    break
+                log.exception("scheduler loop failed")
+                await asyncio.sleep(min(poll_seconds, 10))
             except Exception as exc:
+                if self._stopping.is_set():
+                    break
                 log.exception("scheduler loop failed")
                 try:
                     await asyncio.to_thread(self.store.add_event, "error", f"خطای موتور زمان‌بندی: {exc}")
@@ -946,6 +964,7 @@ class CloudRuntime:
         return result
 
     def shutdown(self):
+        self._stopping.set()
         if self.loop and self.loop.is_running():
             try:
                 async def _close_all():
