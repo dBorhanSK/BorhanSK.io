@@ -2,18 +2,16 @@ services:
   - type: web
     name: meow-studio-cloud
     runtime: docker
-    plan: standard
+    plan: free
     autoDeploy: true
     healthCheckPath: /health
-    disk:
-      name: telegram-browser-profile
-      mountPath: /var/data
-      sizeGB: 2
     envVars:
       - key: PORT
         value: "10000"
       - key: DATA_DIR
-        value: /var/data
+        value: /tmp/meow-data
+      - key: REQUIRE_SUPABASE
+        value: "true"
       - key: TELEGRAM_WEB_URL
         value: https://web.telegram.org/k/
       - key: DASHBOARD_PASSWORD
@@ -22,6 +20,8 @@ services:
         generateValue: true
       - key: WEBHOOK_TOKEN
         generateValue: true
+      - key: PROFILE_ENCRYPTION_KEY
+        sync: false
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_SERVICE_ROLE_KEY
@@ -35,6 +35,12 @@ services:
       - key: KEEPALIVE_INTERVAL_SECONDS
         value: "240"
       - key: KEEPALIVE_TIMEOUT_SECONDS
-        value: "15"
+        value: "20"
+      - key: SESSION_SAVE_INTERVAL_SECONDS
+        value: "60"
+      - key: SUPABASE_HEARTBEAT_INTERVAL_SECONDS
+        value: "240"
+      - key: WAKE_WAIT_SECONDS
+        value: "55"
       - key: COOKIE_SECURE
         value: "true"
