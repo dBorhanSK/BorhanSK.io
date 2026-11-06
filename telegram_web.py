@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from playwright.async_api import async_playwright, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
 log = logging.getLogger("meow.telegram_web")
 
@@ -19,15 +19,20 @@ class TelegramWebError(RuntimeError):
 class TelegramWeb:
     """Automates the official Telegram Web UI; no user API_ID/API_HASH is requested.
 
-    Authentication is performed by scanning Telegram Web's own QR code. The browser's
-    persistent profile is stored on Render's attached disk.
+    Authentication uses Telegram Web's QR flow. The browser storage state (cookies,
+    localStorage and IndexedDB) is exported to the encrypted Supabase runtime-state row.
+    The temporary browser cache itself lives on the ephemeral Render filesystem.
     """
 
-    def __init__(self, profile_dir: str | Path, url: str | None = None, headless: bool = True):
-        self.profile_dir = Path(profile_dir)
+    def __init__(self, profile_dir: str | Path | None = None, url: str | None = None,
+                 headless: bool = True, storage_state: dict[str, Any] | None = None):
+        # profile_dir is retained for backwards compatibility; Free Render has no persistent disk.
+        self.profile_dir = Path(profile_dir) if profile_dir else None
         self.url = url or os.getenv("TELEGRAM_WEB_URL", "https://web.telegram.org/k/")
         self.headless = headless
+        self.initial_storage_state = storage_state
         self.playwright = None
+        self.browser: Browser | None = None
         self.context: BrowserContext | None = None
         self.page: Page | None = None
         self.last_error = ""
@@ -35,39 +40,62 @@ class TelegramWeb:
         self._action_lock = asyncio.Lock()
 
     async def start(self):
-        self.profile_dir.mkdir(parents=True, exist_ok=True)
         self.playwright = await async_playwright().start()
-        self.context = await self.playwright.chromium.launch_persistent_context(
-            user_data_dir=str(self.profile_dir),
+        self.browser = await self.playwright.chromium.launch(
             headless=self.headless,
-            viewport={"width": 1440, "height": 960},
-            locale="en-US",
             args=[
                 "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
                 "--no-first-run", "--no-default-browser-check",
             ],
         )
-        self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
+        context_args = {
+            "viewport": {"width": 1440, "height": 960},
+            "locale": "en-US",
+        }
+        if self.initial_storage_state:
+            context_args["storage_state"] = self.initial_storage_state
+        try:
+            self.context = await self.browser.new_context(**context_args)
+        except Exception as exc:
+            # A stale/incompatible saved state must not prevent the dashboard from booting.
+            log.warning("Saved Telegram Web state could not be restored; starting a fresh session: %s", exc)
+            context_args.pop("storage_state", None)
+            self.context = await self.browser.new_context(**context_args)
+            self.last_error = "نشست ذخیره‌شده بازیابی نشد؛ احتمالاً باید QR را دوباره اسکن کنی."
+        self.page = await self.context.new_page()
         self.page.set_default_timeout(9000)
         self.page.on("pageerror", lambda exc: log.warning("Telegram Web page error: %s", exc))
         await self.page.goto(self.url, wait_until="domcontentloaded", timeout=60000)
-        await self.page.wait_for_timeout(5000)
+        await self.page.wait_for_timeout(4000)
         self.started = True
-        self.last_error = ""
         log.info("Telegram Web opened at %s", self.url)
+
+    async def export_storage_state(self) -> dict[str, Any]:
+        """Return cookies/localStorage/IndexedDB for encrypted persistence in Supabase."""
+        if not self.context:
+            raise TelegramWebError("مرورگر آماده نیست")
+        try:
+            return await self.context.storage_state(indexed_db=True)
+        except TypeError:
+            # Compatibility fallback for older Playwright, though requirements pin a recent version.
+            return await self.context.storage_state()
 
     async def stop(self):
         try:
             if self.context:
                 await self.context.close()
         finally:
-            if self.playwright:
-                await self.playwright.stop()
-            self.started = False
+            try:
+                if self.browser:
+                    await self.browser.close()
+            finally:
+                if self.playwright:
+                    await self.playwright.stop()
+                self.started = False
 
     async def _ensure_page(self) -> Page:
-        if not self.started or not self.context:
-            raise TelegramWebError("مرورگر هنوز آماده نیست")
+        if not self.started or not self.context or not self.browser or not self.browser.is_connected():
+            raise TelegramWebError("مرورگر هنوز آماده نیست یا اتصال Chromium قطع شده است")
         if self.page is None or self.page.is_closed():
             pages = self.context.pages
             self.page = pages[0] if pages else await self.context.new_page()
