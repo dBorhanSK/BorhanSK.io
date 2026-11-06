@@ -38,3 +38,15 @@ alter table public.meow_events enable row level security;
 
 -- No anon/authenticated policies are added. The server uses SUPABASE_SERVICE_ROLE_KEY.
 -- Keep that key only in Render Environment Variables.
+
+
+-- Encrypted Telegram Web browser storage state and runtime heartbeat.
+-- PROFILE_ENCRYPTION_KEY is required on Render; only ciphertext is stored here.
+create table if not exists public.meow_runtime_state (
+  key text primary key,
+  value text not null,
+  updated_at timestamptz not null default now()
+);
+
+alter table public.meow_runtime_state enable row level security;
+-- No anon/authenticated policies: only the server-side service-role key may access it.
