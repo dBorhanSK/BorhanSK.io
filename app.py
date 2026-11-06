@@ -113,6 +113,16 @@ _api_rate: dict[tuple[str, str], list[float]] = {}
 LOGIN_MAX_ATTEMPTS = max(3, int(os.getenv("LOGIN_MAX_ATTEMPTS", "7")))
 LOGIN_LOCK_SECONDS = max(60, int(os.getenv("LOGIN_LOCK_SECONDS", "900")))
 
+# This marker lets the operator verify that the diagnostic build is actually live.
+# Never log the username or password values themselves.
+AUTH_DIAGNOSTICS_BUILD = "auth-diagnostic-2026-11-06-v2"
+log.info(
+    "auth diagnostics active: build=%s owner_username_configured=%s dashboard_password_configured=%s",
+    AUTH_DIAGNOSTICS_BUILD,
+    bool(os.getenv("OWNER_USERNAME", "owner").strip()),
+    bool(os.getenv("DASHBOARD_PASSWORD", "")),
+)
+
 _keepalive_stop = threading.Event()
 _keepalive_thread: threading.Thread | None = None
 _keepalive_lock = threading.Lock()
@@ -411,8 +421,18 @@ def login():
     owner_password = os.getenv("DASHBOARD_PASSWORD", "")
     valid = False
     identity = None
-    if username and username == owner_username and owner_password:
-        valid = hmac.compare_digest(owner_password.encode("utf-8"), password.encode("utf-8"))
+    admin_record_found = False
+    auth_failure_reason = "unknown"
+    owner_username_match = bool(
+        username and owner_username and hmac.compare_digest(username, owner_username)
+    )
+
+    if owner_username_match:
+        if not owner_password:
+            auth_failure_reason = "owner_password_not_configured"
+        else:
+            valid = hmac.compare_digest(owner_password.encode("utf-8"), password.encode("utf-8"))
+            auth_failure_reason = "owner_password_match" if valid else "owner_password_mismatch"
         if valid:
             identity = {"id": "owner", "username": owner_username, "role": "owner"}
     elif username:
@@ -425,21 +445,39 @@ def login():
                 error="ارتباط با پایگاه داده موقتاً برقرار نیست؛ کمی بعد دوباره تلاش کن.",
                 login_csrf=_new_login_csrf_token(),
             ), 503
+        admin_record_found = bool(member)
         if member:
             try:
                 valid = check_password_hash(member["password_hash"], password)
             except (ValueError, TypeError, KeyError):
                 valid = False
+            auth_failure_reason = "admin_password_match" if valid else "admin_password_mismatch"
             if valid:
                 identity = {"id": member["id"], "username": member["username"], "role": "admin"}
+        else:
+            auth_failure_reason = "admin_username_not_found"
+    else:
+        auth_failure_reason = "empty_username"
 
     if not valid or not identity:
+        # Safe server-side diagnostics: no username, password, hash, cookie, or token is logged.
+        log.warning(
+            "login authentication rejected: reason=%s owner_username_match=%s "
+            "owner_password_configured=%s admin_record_found=%s submitted_password_nonempty=%s",
+            auth_failure_reason,
+            owner_username_match,
+            bool(owner_password),
+            admin_record_found,
+            bool(password),
+        )
         _record_login_failure(ip)
         return render_template(
             "login.html",
             error="نام کاربری یا رمز عبور نادرست است.",
             login_csrf=_new_login_csrf_token(),
         ), 401
+
+    log.info("login authentication accepted: role=%s", identity["role"])
 
     _clear_login_failures(ip)
     session.clear()  # Prevent session fixation.
