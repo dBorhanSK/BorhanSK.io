@@ -42,6 +42,9 @@ class Store:
         self._client = None
         url = os.getenv("SUPABASE_URL", "").strip()
         key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+        require_supabase = os.getenv("REQUIRE_SUPABASE", "false").strip().lower() in {"1", "true", "yes", "on"}
+        if bool(url) != bool(key):
+            raise StoreError("برای Supabase باید هر دو SUPABASE_URL و SUPABASE_SERVICE_ROLE_KEY تنظیم شوند")
         if url and key:
             try:
                 from supabase import create_client
@@ -49,7 +52,10 @@ class Store:
                 self.backend = "supabase"
             except Exception as exc:
                 raise StoreError(f"Supabase initialization failed: {exc}") from exc
+        elif require_supabase:
+            raise StoreError("این سرویس به Supabase نیاز دارد؛ SUPABASE_URL و SUPABASE_SERVICE_ROLE_KEY را تنظیم کن")
         else:
+            # Local SQLite is for development only. Render sets REQUIRE_SUPABASE=true.
             base = Path(data_dir)
             base.mkdir(parents=True, exist_ok=True)
             self._db_path = base / "meow-local.sqlite3"
@@ -74,6 +80,9 @@ class Store:
             con.execute("""create table if not exists events (
                 id integer primary key autoincrement, level text not null,
                 message text not null, created_at text not null
+            )""")
+            con.execute("""create table if not exists runtime_state (
+                key text primary key, value text not null, updated_at text not null
             )""")
             con.commit()
 
@@ -188,6 +197,58 @@ class Store:
         with self._lock, self._connect() as con:
             con.execute("update jobs set last_error=?, updated_at=? where id=?",
                         (values["last_error"], values["updated_at"], job_id))
+            con.commit()
+
+    def get_runtime_state(self, key: str) -> str | None:
+        """Fetch an encrypted runtime value (e.g. Telegram Web browser storage state)."""
+        if self._client:
+            data = (self._client.table("meow_runtime_state").select("value")
+                    .eq("key", key).limit(1).execute().data)
+            return str(data[0]["value"]) if data else None
+        with self._lock, self._connect() as con:
+            row = con.execute("select value from runtime_state where key=?", (key,)).fetchone()
+            return str(row["value"]) if row else None
+
+    def set_runtime_state(self, key: str, value: str):
+        """Persist an encrypted runtime value. On Render this always uses Supabase."""
+        now = iso(utcnow())
+        if self._client:
+            self._client.table("meow_runtime_state").upsert(
+                {"key": key, "value": value, "updated_at": now}, on_conflict="key"
+            ).execute()
+            return
+        with self._lock, self._connect() as con:
+            con.execute(
+                "insert into runtime_state(key, value, updated_at) values (?, ?, ?) "
+                "on conflict(key) do update set value=excluded.value, updated_at=excluded.updated_at",
+                (key, value, now),
+            )
+            con.commit()
+
+    def get_runtime_state(self, key: str) -> str | None:
+        """Fetch an encrypted runtime value (e.g. Telegram Web browser storage state)."""
+        if self._client:
+            data = (self._client.table("meow_runtime_state").select("value")
+                    .eq("key", key).limit(1).execute().data)
+            return str(data[0]["value"]) if data else None
+        with self._lock, self._connect() as con:
+            row = con.execute("select value from runtime_state where key=?", (key,)).fetchone()
+            return str(row["value"]) if row else None
+
+    def set_runtime_state(self, key: str, value: str):
+        """Persist an encrypted runtime value. On Render this always uses Supabase."""
+        now = iso(utcnow())
+        if self._client:
+            self._client.table("meow_runtime_state").upsert(
+                {"key": key, "value": value, "updated_at": now}, on_conflict="key"
+            ).execute()
+            return
+        with self._lock, self._connect() as con:
+            con.execute(
+                "insert into runtime_state(key, value, updated_at) values (?, ?, ?) "
+                "on conflict(key) do update set value=excluded.value, updated_at=excluded.updated_at",
+                (key, value, now),
+            )
             con.commit()
 
     def add_event(self, level: str, message: str):
