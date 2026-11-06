@@ -1,0 +1,33 @@
+name: Keep Borhan_SK Render service warm
+
+on:
+  schedule:
+    # Render Free spins down after 15 minutes without inbound traffic.
+    # A public GitHub Actions runner makes a real inbound request every 10 minutes.
+    - cron: "3,13,23,33,43,53 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: borhan-sk-render-keepalive
+  cancel-in-progress: true
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Ping Render health endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="https://borhan-sk.onrender.com/health"
+          curl --fail --silent --show-error \
+            --connect-timeout 10 \
+            --max-time 70 \
+            --retry 1 \
+            --retry-delay 5 \
+            --retry-all-errors \
+            "$URL"
+          echo
