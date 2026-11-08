@@ -1,0 +1,17 @@
+{$API_HOST} {
+    encode zstd gzip
+    header Cache-Control "no-cache"
+    header X-Content-Type-Options "nosniff"
+    header Referrer-Policy "no-referrer"
+
+    @api path /api/* /hooks/* /health /ping
+    handle @api {
+        reverse_proxy backend:8000
+    }
+
+    # noVNC HTML/assets and WebSocket are served directly from the Oracle host.
+    # WebSocket upgrades are forwarded by Caddy automatically.
+    handle {
+        reverse_proxy backend:6080
+    }
+}

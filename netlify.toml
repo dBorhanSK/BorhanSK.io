@@ -1,0 +1,36 @@
+[build]
+  publish = "frontend"
+  # Static site only. The private Oracle VM runs the persistent Telegram Desktop engine.
+
+# Replace YOUR-ORACLE-IP.nip.io with the API_HOST value from your Oracle .env.
+[[redirects]]
+  from = "/api/*"
+  to = "https://YOUR-ORACLE-IP.nip.io/api/:splat"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/hooks/*"
+  to = "https://YOUR-ORACLE-IP.nip.io/hooks/:splat"
+  status = 200
+  force = true
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options = "DENY"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "no-referrer"
+    Permissions-Policy = "camera=(), microphone=(), geolocation=()"
+    Strict-Transport-Security = "max-age=31536000; includeSubDomains"
+    Content-Security-Policy = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; frame-src 'self' https://*.nip.io; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+
+[[headers]]
+  for = "/assets/*"
+  [headers.values]
+    Cache-Control = "public, max-age=300, must-revalidate"
+
+[[headers]]
+  for = "/js/*"
+  [headers.values]
+    Cache-Control = "public, max-age=300"
