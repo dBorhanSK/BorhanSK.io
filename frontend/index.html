@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#050d22">
+  <meta name="robots" content="noindex,nofollow">
+  <title>Borhan_SK</title>
+  <link rel="icon" href="/assets/borhan-mark.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700;800&display=swap">
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <div class="splash" id="splash">
+    <div><img src="/assets/borhan-mark.svg" alt=""><p id="splash-text" class="muted">در حال بارگذاری…</p></div>
+  </div>
+
+  <section id="login" hidden>
+    <div class="login-card">
+      <div class="brandmark"><img src="/assets/borhan-mark.svg" alt="Borhan_SK"><div class="wordmark">Borhan_<b>SK</b></div>
+        <p class="muted small" style="margin:0">پنل امن مدیریت اکانت‌ها و سلف</p></div>
+      <form id="login-form" autocomplete="on">
+        <label>نام کاربری <span class="hint">(مالک: owner — یا خالی بگذار)</span>
+          <input name="username" class="ltr" autocomplete="username" autocapitalize="none" spellcheck="false" placeholder="owner"></label>
+        <label>رمز عبور
+          <input name="password" type="password" class="ltr" autocomplete="current-password" required placeholder="••••••••••••"></label>
+        <div id="login-wake" class="wake" hidden><span class="spin"></span><span>سرور در حال بیدار شدن است؛ چند ثانیه صبر کن…</span></div>
+        <div id="login-err" class="err" hidden></div>
+        <button class="btn primary" type="submit" id="login-btn">ورود به پنل</button>
+      </form>
+    </div>
+  </section>
+
+  <div class="shell" id="app" hidden>
+    <aside class="side" id="side">
+      <div class="brand"><img src="/assets/borhan-mark.svg" alt=""><div class="wordmark">Borhan_<b>SK</b></div></div>
+      <nav id="nav"></nav>
+      <div class="side-foot">
+        <div class="me"><div class="avatar" id="me-av">?</div><div class="grow"><b id="me-name"></b><div class="small muted" id="me-role"></div></div></div>
+        <button class="btn ghost" id="logout-btn">خروج از پنل</button>
+      </div>
+    </aside>
+    <main class="main">
+      <div class="topbar">
+        <button class="btn icon menu-btn" id="menu-btn" aria-label="منو"></button>
+        <div class="grow"><div class="eyebrow" id="eyebrow">BORHAN_SK</div><h1 id="title"></h1></div>
+        <span class="pill" id="engine-pill"><i></i><span>…</span></span>
+      </div>
+      <div id="view"></div>
+    </main>
+  </div>
+  <div id="toasts"></div>
+  <script type="module" src="/js/app.js"></script>
+</body>
+</html>
