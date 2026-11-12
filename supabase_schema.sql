@@ -71,7 +71,8 @@ alter table public.meow_events add column if not exists owner_id text not null d
 create index if not exists meow_events_created_idx on public.meow_events (created_at desc);
 create index if not exists meow_events_owner_idx on public.meow_events (owner_id, created_at desc);
 
--- Runtime metadata and service heartbeat. Telegram Desktop profile data stays on the Oracle persistent disk.
+-- Runtime metadata and service heartbeat only. Telegram Desktop profile files are NOT stored in Supabase.
+-- The current desktop engine requires a persistent server disk for /data/telegram.
 create table if not exists public.meow_runtime_state (
   key text primary key,
   value text not null,
@@ -93,7 +94,6 @@ grant all privileges on table public.meow_members, public.meow_accounts, public.
 revoke all privileges on sequence public.meow_events_id_seq from public, anon, authenticated;
 grant usage, select on sequence public.meow_events_id_seq to service_role;
 
--- Legacy Telethon and Telegram-Web session blobs are not compatible with Telegram Desktop.
--- Remove only those obsolete session keys. Account, admin, job and event rows are retained.
-delete from public.meow_runtime_state where key like 'tg_session:%' or key like 'telegram_web_storage_state%';
-update public.meow_accounts set status = 'pending' where status <> 'pending';
+-- IMPORTANT: This schema file intentionally does not delete existing runtime-state rows
+-- and does not reset account statuses. Preserve current account/admin/job data on re-runs.
+-- Old legacy session keys can be reviewed and deleted manually only after a backup.
