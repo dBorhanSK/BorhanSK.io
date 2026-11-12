@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import os
 import secrets
+import stat
+import time
 from pathlib import Path
 
 from flask import Blueprint, jsonify, request, send_from_directory
@@ -11,6 +13,50 @@ from werkzeug.utils import secure_filename
 from deps import account_for, audit, err, hub, limited, login_required
 
 bp = Blueprint("desktop", __name__, url_prefix="/api/accounts/<account_id>/desktop")
+
+
+def cleanup_expired_uploads() -> int:
+    """Remove old temporary files uploaded for sending through Telegram Desktop.
+
+    This deliberately does not touch Telegram profiles, downloaded files, or
+    Supabase rows. Set UPLOAD_RETENTION_HOURS=0 to disable the cleanup.
+    """
+    try:
+        retention_hours = int(os.getenv("UPLOAD_RETENTION_HOURS", "48"))
+    except (TypeError, ValueError):
+        retention_hours = 48
+    if retention_hours <= 0:
+        return 0
+
+    root = Path(os.getenv("TELEGRAM_UPLOAD_DIR", "/data/uploads"))
+    if not root.is_dir() or root.is_symlink():
+        return 0
+    cutoff = time.time() - retention_hours * 3600
+    removed = 0
+
+    # Do not follow symlinks: uploads should remain confined to the upload root.
+    for current, dirs, files in os.walk(root, topdown=False, followlinks=False):
+        current_path = Path(current)
+        for filename in files:
+            path = current_path / filename
+            try:
+                info = path.lstat()
+                if stat.S_ISREG(info.st_mode) and info.st_mtime < cutoff:
+                    path.unlink()
+                    removed += 1
+            except FileNotFoundError:
+                continue
+            except OSError:
+                continue
+        for dirname in dirs:
+            path = current_path / dirname
+            try:
+                if path.is_symlink():
+                    continue
+                path.rmdir()
+            except OSError:
+                pass
+    return removed
 
 
 def _account(account_id):
