@@ -455,17 +455,44 @@ def create_app(testing: bool = False, store_obj: Store | None = None, hub_obj=No
         tg.ready.wait(5)
         self_bot.Scheduler(st, tg).start()
         atexit.register(tg.shutdown)
-        # A low-cost heartbeat records service liveness in Supabase. This is useful
-        # for diagnostics/backups, but it does NOT prevent a cloud provider from
-        # reclaiming an Always Free VM based on its own utilization policy.
-        def heartbeat():
+        # Supabase holds durable records. Keep the event table bounded without
+        # deleting accounts, admins, active/paused jobs, or Telegram profile data.
+        def housekeeping():
+            try:
+                cleanup_interval = max(3600, int(os.getenv("CLEANUP_INTERVAL_SECONDS", "21600")))
+            except (TypeError, ValueError):
+                cleanup_interval = 21600
+            try:
+                heartbeat_interval = max(60, int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "300")))
+            except (TypeError, ValueError):
+                heartbeat_interval = 300
+            last_cleanup = 0.0
             while True:
                 try:
                     st.set_runtime_state("service:heartbeat", utcnow().isoformat())
                 except Exception:
                     log.exception("Supabase heartbeat failed")
-                time.sleep(max(60, int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "300"))))
-        threading.Thread(target=heartbeat, daemon=True, name="supabase-heartbeat").start()
+
+                now_mono = time.monotonic()
+                if now_mono - last_cleanup >= cleanup_interval:
+                    try:
+                        retention_days = int(os.getenv("EVENT_RETENTION_DAYS", "30"))
+                        if retention_days > 0:
+                            deleted = st.delete_events_before(utcnow() - timedelta(days=retention_days))
+                            if deleted:
+                                log.info("housekeeping removed %s event rows older than %s days", deleted, retention_days)
+                    except Exception:
+                        log.exception("Supabase event cleanup failed")
+                    try:
+                        removed_uploads = desktop.cleanup_expired_uploads()
+                        if removed_uploads:
+                            log.info("housekeeping removed %s expired temporary uploads", removed_uploads)
+                    except Exception:
+                        log.exception("temporary upload cleanup failed")
+                    last_cleanup = now_mono
+
+                time.sleep(heartbeat_interval)
+        threading.Thread(target=housekeeping, daemon=True, name="borhan-housekeeping").start()
     return app
 
 
