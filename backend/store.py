@@ -355,3 +355,14 @@ class Store:
         limit = max(1, min(int(limit), 200))
         where = {"owner_id": owner_id} if owner_id is not None else None
         return self._select("meow_events", where, order="created_at" if self._client else "id", desc=True, limit=limit)
+
+    def delete_events_before(self, cutoff: datetime) -> int:
+        """Delete only old audit/event rows; never touch accounts, admins, or jobs."""
+        cutoff_iso = iso(cutoff)
+        if self._client:
+            result = self._client.table("meow_events").delete().lt("created_at", cutoff_iso).execute()
+            return len(result.data or [])
+        with self._lock, self._connect() as con:
+            cur = con.execute("delete from meow_events where created_at < ?", (cutoff_iso,))
+            con.commit()
+            return int(cur.rowcount)
