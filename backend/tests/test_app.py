@@ -130,6 +130,15 @@ class StoreTests(Base):
         self.assertEqual(len(self.store.list_events(10, "x")), 1)
         self.assertEqual(self.store.list_events(10)[0]["message"], "b")
 
+    def test_event_retention_deletes_only_old_events(self):
+        from datetime import timedelta
+        from store import utcnow
+
+        self.store.add_event("info", "keep this", "owner")
+        deleted = self.store.delete_events_before(utcnow() + timedelta(seconds=1))
+        self.assertEqual(deleted, 1)
+        self.assertEqual(self.store.list_events(10), [])
+
 
 class AuthTests(Base):
     def test_login_and_csrf(self):
